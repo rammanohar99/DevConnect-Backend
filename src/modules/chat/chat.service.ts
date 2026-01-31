@@ -13,6 +13,7 @@ import {
 } from './chat.types'
 import { NotFoundError, ValidationError } from '../../shared/types/errors'
 import logger from '../../shared/utils/logger'
+import { cacheService } from '../../shared/utils/cache'
 
 /**
  * Send a message in a chat
@@ -48,6 +49,13 @@ export const sendMessage = async (
     // Update chat's lastMessage
     chat.lastMessage = message._id
     await chat.save()
+
+    // Invalidate chat caches for all participants
+    for (const participantId of chat.participants) {
+      await cacheService.invalidatePattern(`chats:user:${participantId.toString()}:*`)
+    }
+    await cacheService.delete(`chat:${chatId}`)
+    await cacheService.invalidatePattern(`messages:chat:${chatId}:*`)
 
     // Populate sender info
     const populatedMessage = await Message.findById(message._id)
@@ -104,6 +112,11 @@ export const createGroupChat = async (
       name: name.trim(),
       participants: uniqueParticipants,
     })
+
+    // Invalidate chat caches for all participants
+    for (const participantId of uniqueParticipants) {
+      await cacheService.invalidatePattern(`chats:user:${participantId}:*`)
+    }
 
     // Populate participants
     const populatedChat = await Chat.findById(chat._id)
@@ -221,6 +234,18 @@ export const getMessages = async (
 
     const page = Math.max(1, query.page || 1)
     const limit = Math.min(100, Math.max(1, query.limit || 50))
+
+    // Try cache first
+    const cacheKey = `messages:chat:${chatId}:page:${page}:limit:${limit}`
+    const cached = await cacheService.get<PaginatedMessages>(cacheKey)
+
+    if (cached) {
+      logger.debug('Cache hit for messages', { chatId, page, limit })
+      return cached
+    }
+
+    logger.debug('Cache miss for messages', { chatId, page, limit })
+
     const skip = (page - 1) * limit
 
     // Get messages in reverse chronological order
@@ -237,15 +262,7 @@ export const getMessages = async (
     // Reverse to show oldest first in the page
     const messagesInOrder = messages.reverse()
 
-    logger.debug('Retrieved messages', {
-      chatId,
-      userId,
-      page,
-      limit,
-      total,
-    })
-
-    return {
+    const result = {
       messages: messagesInOrder.map(formatMessageResponse),
       pagination: {
         page,
@@ -254,6 +271,19 @@ export const getMessages = async (
         pages: Math.ceil(total / limit),
       },
     }
+
+    // Cache for 2 minutes
+    await cacheService.set(cacheKey, result, 2 * 60)
+
+    logger.debug('Retrieved messages', {
+      chatId,
+      userId,
+      page,
+      limit,
+      total,
+    })
+
+    return result
   } catch (error) {
     logger.error('Failed to get messages', {
       userId,
@@ -293,6 +323,9 @@ export const markAsRead = async (userId: string, chatId: string): Promise<void> 
       }
     )
 
+    // Invalidate messages cache
+    await cacheService.invalidatePattern(`messages:chat:${chatId}:*`)
+
     logger.info('Messages marked as read', {
       chatId,
       userId,
@@ -318,6 +351,18 @@ export const getChatsByUser = async (
   try {
     const page = Math.max(1, query.page || 1)
     const limit = Math.min(100, Math.max(1, query.limit || 20))
+
+    // Try cache first
+    const cacheKey = `chats:user:${userId}:page:${page}:limit:${limit}`
+    const cached = await cacheService.get<PaginatedChats>(cacheKey)
+
+    if (cached) {
+      logger.debug('Cache hit for user chats', { userId, page, limit })
+      return cached
+    }
+
+    logger.debug('Cache miss for user chats', { userId, page, limit })
+
     const skip = (page - 1) * limit
 
     const userObjectId = new Types.ObjectId(userId)
@@ -340,14 +385,7 @@ export const getChatsByUser = async (
       Chat.countDocuments({ participants: userObjectId }),
     ])
 
-    logger.debug('Retrieved user chats', {
-      userId,
-      page,
-      limit,
-      total,
-    })
-
-    return {
+    const result = {
       chats: chats.map(formatChatResponse),
       pagination: {
         page,
@@ -356,6 +394,18 @@ export const getChatsByUser = async (
         pages: Math.ceil(total / limit),
       },
     }
+
+    // Cache for 2 minutes
+    await cacheService.set(cacheKey, result, 2 * 60)
+
+    logger.debug('Retrieved user chats', {
+      userId,
+      page,
+      limit,
+      total,
+    })
+
+    return result
   } catch (error) {
     logger.error('Failed to get user chats', {
       userId,
@@ -370,6 +420,24 @@ export const getChatsByUser = async (
  */
 export const getChatById = async (userId: string, chatId: string): Promise<ChatResponse> => {
   try {
+    // Try cache first
+    const cacheKey = `chat:${chatId}`
+    const cached = await cacheService.get<ChatResponse>(cacheKey)
+
+    if (cached) {
+      // Still verify user is a participant
+      const isParticipant = cached.participants.some((p: any) => p._id === userId)
+
+      if (!isParticipant) {
+        throw new ValidationError('User is not a participant in this chat', [])
+      }
+
+      logger.debug('Cache hit for chat', { chatId, userId })
+      return cached
+    }
+
+    logger.debug('Cache miss for chat', { chatId, userId })
+
     const chat = await Chat.findById(chatId)
       .populate('participants', 'username email profile.name profile.avatar')
       .populate({
@@ -393,12 +461,17 @@ export const getChatById = async (userId: string, chatId: string): Promise<ChatR
       throw new ValidationError('User is not a participant in this chat', [])
     }
 
+    const response = formatChatResponse(chat)
+
+    // Cache for 3 minutes
+    await cacheService.set(cacheKey, response, 3 * 60)
+
     logger.debug('Retrieved chat', {
       chatId,
       userId,
     })
 
-    return formatChatResponse(chat)
+    return response
   } catch (error) {
     logger.error('Failed to get chat', {
       userId,

@@ -3,6 +3,7 @@ import { Notification, INotification } from './notification.model'
 import { CreateNotificationDTO, NotificationFilters } from './notification.types'
 import { NotFoundError, ValidationError } from '../../shared/types/errors'
 import logger from '../../shared/utils/logger'
+import { cacheService } from '../../shared/utils/cache'
 
 export class NotificationService {
   /**
@@ -56,6 +57,10 @@ export class NotificationService {
 
       await notification.save()
 
+      // Invalidate notifications cache
+      await cacheService.invalidatePattern(`notifications:user:${data.recipientId}:*`)
+      await cacheService.delete(`notifications:unread:${data.recipientId}`)
+
       // Populate actor information
       await notification.populate('actor', 'username profile.name profile.avatar')
 
@@ -88,6 +93,17 @@ export class NotificationService {
       ])
     }
 
+    // Generate cache key based on filters
+    const cacheKey = `notifications:user:${userId}:read:${filters.isRead ?? 'all'}:type:${filters.type || 'all'}`
+    const cached = await cacheService.get<INotification[]>(cacheKey)
+
+    if (cached) {
+      logger.debug('Cache hit for notifications', { userId, filters })
+      return cached
+    }
+
+    logger.debug('Cache miss for notifications', { userId, filters })
+
     const query: any = {
       recipient: userId,
     }
@@ -107,6 +123,9 @@ export class NotificationService {
       .limit(50) // Limit to most recent 50 notifications
       .lean()
       .exec()
+
+    // Cache for 30 seconds (notifications update frequently)
+    await cacheService.set(cacheKey, notifications, 30)
 
     return notifications as unknown as INotification[]
   }
@@ -138,6 +157,10 @@ export class NotificationService {
     notification.isRead = true
     await notification.save()
 
+    // Invalidate notifications cache
+    await cacheService.invalidatePattern(`notifications:user:${userId}:*`)
+    await cacheService.delete(`notifications:unread:${userId}`)
+
     // Populate actor information
     await notification.populate('actor', 'username profile.name profile.avatar')
 
@@ -164,6 +187,10 @@ export class NotificationService {
       { $set: { isRead: true } }
     )
 
+    // Invalidate notifications cache
+    await cacheService.invalidatePattern(`notifications:user:${userId}:*`)
+    await cacheService.delete(`notifications:unread:${userId}`)
+
     logger.info('All notifications marked as read', {
       userId,
       modifiedCount: result.modifiedCount,
@@ -182,10 +209,24 @@ export class NotificationService {
       ])
     }
 
+    // Try cache first
+    const cacheKey = `notifications:unread:${userId}`
+    const cached = await cacheService.get<number>(cacheKey)
+
+    if (cached !== null) {
+      logger.debug('Cache hit for unread count', { userId })
+      return cached
+    }
+
+    logger.debug('Cache miss for unread count', { userId })
+
     const count = await Notification.countDocuments({
       recipient: userId,
       isRead: false,
     })
+
+    // Cache for 30 seconds (polled frequently)
+    await cacheService.set(cacheKey, count, 30)
 
     return count
   }

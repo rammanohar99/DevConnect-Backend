@@ -10,6 +10,7 @@ import {
 import { NotFoundError, ValidationError } from '../../shared/types/errors'
 import logger from '../../shared/utils/logger'
 import { logPasswordChanged } from '../../shared/utils/securityLogger'
+import { cacheService } from '../../shared/utils/cache'
 
 export class UserService {
   /**
@@ -20,6 +21,18 @@ export class UserService {
   async getAllUsers(options: { search?: string; limit?: number }): Promise<UserListItem[]> {
     try {
       const { search, limit = 50 } = options
+
+      // Generate cache key based on search and limit
+      const cacheKey = `users:list:search:${search || 'all'}:limit:${limit}`
+      const cached = await cacheService.get<UserListItem[]>(cacheKey)
+
+      if (cached) {
+        logger.debug('Cache hit for users list', { search, limit })
+        return cached
+      }
+
+      logger.debug('Cache miss for users list', { search, limit })
+
       const query: any = {}
 
       // Add search filter if provided
@@ -38,7 +51,7 @@ export class UserService {
 
       logger.debug('Users retrieved', { count: users.length, search })
 
-      return users.map((user) => ({
+      const result = users.map((user) => ({
         _id: user._id.toString(),
         username: user.username,
         email: user.email,
@@ -47,6 +60,11 @@ export class UserService {
           avatar: user.profile.avatar,
         },
       }))
+
+      // Cache for 3 minutes
+      await cacheService.set(cacheKey, result, 3 * 60)
+
+      return result
     } catch (error) {
       logger.error('Error retrieving users', { error })
       throw error
@@ -61,6 +79,17 @@ export class UserService {
    */
   async getUserById(userId: string): Promise<IUser> {
     try {
+      // Try cache first
+      const cacheKey = `user:${userId}`
+      const cached = await cacheService.get<IUser>(cacheKey)
+
+      if (cached) {
+        logger.debug('Cache hit for user', { userId })
+        return cached
+      }
+
+      logger.debug('Cache miss for user', { userId })
+
       const user = await User.findById(userId)
 
       if (!user) {
@@ -68,6 +97,10 @@ export class UserService {
       }
 
       logger.debug('User retrieved', { userId })
+
+      // Cache for 5 minutes
+      await cacheService.set(cacheKey, user, 5 * 60)
+
       return user
     } catch (error) {
       if (error instanceof NotFoundError) {
@@ -112,6 +145,11 @@ export class UserService {
 
       await user.save()
 
+      // Invalidate user cache
+      await cacheService.delete(`user:${userId}`)
+      await cacheService.delete(`user:profile:${userId}`)
+      await cacheService.invalidatePattern('users:list:*')
+
       logger.info('User profile updated', { userId })
       return mapUserToResponse(user)
     } catch (error) {
@@ -131,6 +169,17 @@ export class UserService {
    */
   async getUserProfile(userId: string): Promise<PublicProfile> {
     try {
+      // Try cache first
+      const cacheKey = `user:profile:${userId}`
+      const cached = await cacheService.get<PublicProfile>(cacheKey)
+
+      if (cached) {
+        logger.debug('Cache hit for user profile', { userId })
+        return cached
+      }
+
+      logger.debug('Cache miss for user profile', { userId })
+
       const user = await User.findById(userId)
 
       if (!user) {
@@ -138,7 +187,13 @@ export class UserService {
       }
 
       logger.debug('Public profile retrieved', { userId })
-      return mapUserToPublicProfile(user)
+
+      const profile = mapUserToPublicProfile(user)
+
+      // Cache for 5 minutes
+      await cacheService.set(cacheKey, profile, 5 * 60)
+
+      return profile
     } catch (error) {
       if (error instanceof NotFoundError) {
         throw error
@@ -165,6 +220,11 @@ export class UserService {
 
       user.profile.avatar = avatarUrl
       await user.save()
+
+      // Invalidate user cache
+      await cacheService.delete(`user:${userId}`)
+      await cacheService.delete(`user:profile:${userId}`)
+      await cacheService.invalidatePattern('users:list:*')
 
       logger.info('User avatar updated', { userId, avatarUrl })
       return mapUserToResponse(user)
@@ -216,6 +276,10 @@ export class UserService {
       // Update password (will be hashed by pre-save hook)
       user.password = newPassword
       await user.save()
+
+      // Invalidate user cache (security-related change)
+      await cacheService.delete(`user:${userId}`)
+      await cacheService.delete(`user:profile:${userId}`)
 
       // Log security event
       logPasswordChanged(userId, user.email, ip)
@@ -273,6 +337,10 @@ export class UserService {
       }
 
       await user.save()
+
+      // Invalidate user cache
+      await cacheService.delete(`user:${userId}`)
+      await cacheService.delete(`user:profile:${userId}`)
 
       logger.info('User notification preferences updated', { userId })
       return mapUserToResponse(user)

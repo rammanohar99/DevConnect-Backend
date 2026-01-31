@@ -13,6 +13,7 @@ import {
 import { NotFoundError, ValidationError } from '../../shared/types/errors'
 import { notificationService } from '../notifications/notification.service'
 import logger from '../../shared/utils/logger'
+import { cacheService } from '../../shared/utils/cache'
 
 export class IssueService {
   /**
@@ -30,6 +31,10 @@ export class IssueService {
     })
 
     await issue.save()
+
+    // Invalidate issues cache
+    await cacheService.invalidatePattern('issues:*')
+
     return issue
   }
 
@@ -43,6 +48,17 @@ export class IssueService {
       ])
     }
 
+    // Try cache first
+    const cacheKey = `issue:${issueId}`
+    const cached = await cacheService.get<IIssue>(cacheKey)
+
+    if (cached) {
+      logger.debug('Cache hit for issue', { issueId })
+      return cached
+    }
+
+    logger.debug('Cache miss for issue', { issueId })
+
     const issue = await Issue.findById(issueId)
       .populate('creator', 'username profile.name profile.avatar')
       .populate('assignees', 'username profile.name profile.avatar')
@@ -50,6 +66,9 @@ export class IssueService {
     if (!issue) {
       throw new NotFoundError('Issue')
     }
+
+    // Cache for 3 minutes
+    await cacheService.set(cacheKey, issue, 3 * 60)
 
     return issue
   }
@@ -76,6 +95,10 @@ export class IssueService {
     issue.status = data.status
     await issue.save()
 
+    // Invalidate issue cache
+    await cacheService.delete(`issue:${issueId}`)
+    await cacheService.invalidatePattern('issues:*')
+
     return issue
   }
 
@@ -99,6 +122,10 @@ export class IssueService {
       issue.assignees.push(assigneeObjectId)
       await issue.save()
 
+      // Invalidate issue cache
+      await cacheService.delete(`issue:${issueId}`)
+      await cacheService.invalidatePattern('issues:*')
+
       // Create notification for assignee (async, don't await)
       this.createAssignmentNotification(data.assigneeId, issueId, issue.title).catch((error) => {
         logger.error('Error creating assignment notification:', error)
@@ -121,6 +148,10 @@ export class IssueService {
     if (!issue.labels.includes(data.label)) {
       issue.labels.push(data.label)
       await issue.save()
+
+      // Invalidate issue cache
+      await cacheService.delete(`issue:${issueId}`)
+      await cacheService.invalidatePattern('issues:*')
     }
 
     return issue
@@ -135,6 +166,10 @@ export class IssueService {
     issue.labels = issue.labels.filter((label) => label !== data.label)
     await issue.save()
 
+    // Invalidate issue cache
+    await cacheService.delete(`issue:${issueId}`)
+    await cacheService.invalidatePattern('issues:*')
+
     return issue
   }
 
@@ -142,6 +177,18 @@ export class IssueService {
    * Filter issues with multiple criteria
    */
   async filterIssues(filters: IssueFilters): Promise<IIssue[]> {
+    // Generate cache key based on filters
+    const cacheKey = `issues:status:${filters.status || 'all'}:labels:${filters.labels?.join(',') || 'none'}:assignee:${filters.assignee || 'none'}:creator:${filters.creator || 'none'}:priority:${filters.priority || 'all'}`
+    
+    const cached = await cacheService.get<IIssue[]>(cacheKey)
+
+    if (cached) {
+      logger.debug('Cache hit for issues filter', { filters })
+      return cached
+    }
+
+    logger.debug('Cache miss for issues filter', { filters })
+
     const query: any = {}
 
     if (filters.status) {
@@ -179,6 +226,9 @@ export class IssueService {
       .populate('assignees', 'username profile.name profile.avatar')
       .sort({ createdAt: -1 })
 
+    // Cache for 3 minutes
+    await cacheService.set(cacheKey, issues, 3 * 60)
+
     return issues
   }
 
@@ -202,6 +252,11 @@ export class IssueService {
     issue.commentCount += 1
     await issue.save()
 
+    // Invalidate issue cache
+    await cacheService.delete(`issue:${issueId}`)
+    await cacheService.delete(`issue:comments:${issueId}`)
+    await cacheService.invalidatePattern('issues:*')
+
     // Populate author before returning
     await comment.populate('author', 'username profile.name profile.avatar')
 
@@ -224,12 +279,26 @@ export class IssueService {
    * Get comments for an issue
    */
   async getIssueComments(issueId: string): Promise<any[]> {
+    // Try cache first
+    const cacheKey = `issue:comments:${issueId}`
+    const cached = await cacheService.get<any[]>(cacheKey)
+
+    if (cached) {
+      logger.debug('Cache hit for issue comments', { issueId })
+      return cached
+    }
+
+    logger.debug('Cache miss for issue comments', { issueId })
+
     // Verify issue exists
     await this.getIssueById(issueId)
 
     const comments = await Comment.find({ issue: issueId })
       .populate('author', 'username profile.name profile.avatar')
       .sort({ createdAt: -1 })
+
+    // Cache for 2 minutes
+    await cacheService.set(cacheKey, comments, 2 * 60)
 
     return comments
   }
