@@ -19,6 +19,8 @@ export const connectRedis = async (): Promise<void> => {
           }
           return retries * 100
         },
+        tls: config.redis.url.startsWith('rediss://'),
+        rejectUnauthorized: false, // For Railway/cloud Redis services
       },
     })
 
