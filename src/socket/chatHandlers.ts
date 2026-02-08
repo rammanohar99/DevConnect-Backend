@@ -13,6 +13,7 @@ interface AuthenticatedSocket extends Socket {
 interface SendMessagePayload {
   chatId: string
   content: string
+
 }
 
 interface JoinChatPayload {
